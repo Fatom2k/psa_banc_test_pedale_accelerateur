@@ -21,6 +21,14 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <math.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "web_page.h"
+
+// Interface web : point d'accès Wi-Fi -> http://192.168.4.1
+#define WIFI_ENABLE 1
+#define WIFI_SSID   "BANC-PEDALE"
+#define WIFI_PASS   "psa12345"      // 8 caractères minimum
 
 #ifdef USE_ADS1115
   #include <Wire.h>
@@ -69,6 +77,9 @@ struct Shared {
   // extrêmes depuis la dernière image (pour voir les pointes brèves)
   bool  wValid;
   float wErrMin, wErrMax, wS1Min, wS1Max, wS2kMin, wS2kMax;
+  // idem, depuis la dernière requête de la page web
+  bool  bValid;
+  float bErrMin, bErrMax, bS1Min, bS1Max, bS2kMin, bS2kMax;
   // depuis la dernière remise à zéro
   float errMaxAbs, errMaxSigned, errMaxPos;
   float s1Min, s1Max, s2Min, s2Max, vccMin, vccMax;
@@ -99,6 +110,12 @@ static void resetWindow(Shared &s) {
   s.wErrMax = s.wS1Max = s.wS2kMax = -1e9f;
 }
 
+static void resetWebWindow(Shared &s) {
+  s.bValid = false;
+  s.bErrMin = s.bS1Min = s.bS2kMin = 1e9f;
+  s.bErrMax = s.bS1Max = s.bS2kMax = -1e9f;
+}
+
 static void resetStats(Shared &s) {
   s.errMaxAbs = 0; s.errMaxSigned = 0; s.errMaxPos = 0;
   s.s1Min = s.s2Min = s.vccMin = 1e9f;
@@ -107,6 +124,7 @@ static void resetStats(Shared &s) {
   s.n = s.sx = s.sy = s.sxx = s.sxy = s.syy = 0;
   for (int i = 0; i < NBINS; i++) s.binErr[i] = -1.0f;
   resetWindow(s);
+  resetWebWindow(s);
 }
 
 // ----------------------------------------------------------------------------
@@ -165,6 +183,13 @@ static void samplingTask(void *) {
     if (s1  > g.wS1Max)  g.wS1Max  = s1;
     if (s2k < g.wS2kMin) g.wS2kMin = s2k;
     if (s2k > g.wS2kMax) g.wS2kMax = s2k;
+    g.bValid = true;
+    if (err < g.bErrMin) g.bErrMin = err;
+    if (err > g.bErrMax) g.bErrMax = err;
+    if (s1  < g.bS1Min)  g.bS1Min  = s1;
+    if (s1  > g.bS1Max)  g.bS1Max  = s1;
+    if (s2k < g.bS2kMin) g.bS2kMin = s2k;
+    if (s2k > g.bS2kMax) g.bS2kMax = s2k;
 
     // extrêmes
     if (s1  < g.s1Min)  g.s1Min  = s1;   if (s1  > g.s1Max)  g.s1Max  = s1;
@@ -384,6 +409,16 @@ static void screenSweep(const Shared &s) {
   spr.drawString("100%", 238, 127);
 }
 
+static bool regression(const Shared &s, double &a, double &b, double &r2) {
+  const double den = s.n * s.sxx - s.sx * s.sx;
+  if (s.n <= 50 || den <= 1e-6 * s.n * s.n) return false;
+  a = (s.n * s.sxy - s.sx * s.sy) / den;
+  b = (s.sy - a * s.sx) / s.n;
+  const double dy = s.n * s.syy - s.sy * s.sy;
+  r2 = (dy > 0) ? pow(s.n * s.sxy - s.sx * s.sy, 2) / (den * dy) : 0;
+  return true;
+}
+
 static void screenStats(const Shared &s) {
   drawHeader("STATISTIQUES", s);
   char buf[64];
@@ -392,12 +427,8 @@ static void screenStats(const Shared &s) {
   int y = 21;
   auto line = [&](uint16_t c) { spr.setTextColor(c); spr.drawString(buf, 4, y); y += 16; };
 
-  double den = s.n * s.sxx - s.sx * s.sx;
-  if (s.n > 50 && den > 1e-6 * s.n * s.n) {
-    double a = (s.n * s.sxy - s.sx * s.sy) / den;
-    double b = (s.sy - a * s.sx) / s.n;
-    double dy = s.n * s.syy - s.sy * s.sy;
-    double r2 = (dy > 0) ? pow(s.n * s.sxy - s.sx * s.sy, 2) / (den * dy) : 0;
+  double a, b, r2;
+  if (regression(s, a, b, r2)) {
     snprintf(buf, sizeof buf, "Pente S1/S2 %.3f (nominal %.1f)", a, K_NOM);
     line(fabs(a - K_NOM) > 0.1 ? C_WARN : C_OK);
     snprintf(buf, sizeof buf, "Decalage %+.3fV   R2 %.5f", b * 5.0, r2);
@@ -415,6 +446,7 @@ static void screenStats(const Shared &s) {
   snprintf(buf, sizeof buf, "ADC ESP32  %lu ech.  %lu Hz", (unsigned long)s.nSamples, (unsigned long)s.rateHz);
 #endif
   line(C_DIM);
+  if (WIFI_ENABLE) { snprintf(buf, sizeof buf, "WiFi %s  192.168.4.1", WIFI_SSID); line(C_DIM); }
 }
 
 // ----------------------------------------------------------------------------
@@ -426,6 +458,84 @@ static bool pressed(int pin, bool &last, uint32_t &tLast) {
   if (now != last) tLast = millis();
   last = now;
   return edge;
+}
+
+
+// ----------------------------------------------------------------------------
+// Serveur web
+// ----------------------------------------------------------------------------
+static WebServer server(80);
+
+static void handleLive() {
+  Shared s;
+  xSemaphoreTake(mtx, portMAX_DELAY);
+  s = g;
+  resetWebWindow(g);
+  xSemaphoreGive(mtx);
+
+  const char *st; uint16_t col;
+  status(s, st, col);
+  const float vref = (s.vcc > 3.0f) ? s.vcc : 5.0f;
+  const float err = (s.s1 - K_NOM * s.s2) / vref * 100.0f;
+  double a = 0, b = 0, r2 = 0;
+  const bool reg = regression(s, a, b, r2);
+  if (!s.bValid) { s.bErrMin = s.bErrMax = err; s.bS1Min = s.bS1Max = s.s1; s.bS2kMin = s.bS2kMax = K_NOM * s.s2; }
+
+  static char j[1024];
+  snprintf(j, sizeof j,
+    "{\"t\":%lu,\"st\":\"%s\",\"s1\":%.4f,\"s2\":%.4f,\"vcc\":%.4f,\"err\":%.3f,\"pos\":%.1f,"
+    "\"w\":{\"emin\":%.3f,\"emax\":%.3f,\"s1min\":%.4f,\"s1max\":%.4f,\"s2kmin\":%.4f,\"s2kmax\":%.4f},"
+    "\"errMax\":%.3f,\"errMaxPos\":%.1f,\"faults\":%lu,\"oor\":%lu,\"n\":%lu,\"hz\":%lu,"
+    "\"s1r\":[%.4f,%.4f],\"s2r\":[%.4f,%.4f],\"vccr\":[%.4f,%.4f],"
+    "\"reg\":%s,\"a\":%.4f,\"b\":%.4f,\"r2\":%.6f,"
+    "\"th\":{\"k\":%.2f,\"warn\":%.1f,\"fault\":%.1f},\"adc\":\"%s\"}",
+    (unsigned long)millis(), st, s.s1, s.s2, s.vcc, err, pedalPos(s),
+    s.bErrMin, s.bErrMax, s.bS1Min, s.bS1Max, s.bS2kMin, s.bS2kMax,
+    s.errMaxSigned, s.errMaxPos, (unsigned long)s.faultEvents, (unsigned long)s.oorEvents,
+    (unsigned long)s.nSamples, (unsigned long)s.rateHz,
+    s.s1Min < 1e8f ? s.s1Min : 0, s.s1Max > -1e8f ? s.s1Max : 0,
+    s.s2Min < 1e8f ? s.s2Min : 0, s.s2Max > -1e8f ? s.s2Max : 0,
+    s.vccMin < 1e8f ? s.vccMin : 0, s.vccMax > -1e8f ? s.vccMax : 0,
+    reg ? "true" : "false", a, b * 5.0, r2,
+    K_NOM, WARN_PCT, FAULT_PCT,
+#ifdef USE_ADS1115
+    "ADS1115"
+#else
+    "ESP32"
+#endif
+  );
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+static void handleSweep() {
+  float bins[NBINS];
+  xSemaphoreTake(mtx, portMAX_DELAY);
+  memcpy(bins, g.binErr, sizeof bins);
+  xSemaphoreGive(mtx);
+  String s = "[";
+  char b[16];
+  for (int i = 0; i < NBINS; i++) {
+    if (bins[i] < 0) snprintf(b, sizeof b, "%snull", i ? "," : "");
+    else snprintf(b, sizeof b, "%s%.2f", i ? "," : "", bins[i]);
+    s += b;
+  }
+  s += "]";
+  server.send(200, "application/json", s);
+}
+
+static void startWeb() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(WIFI_SSID, WIFI_PASS);
+  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", WEB_PAGE); });
+  server.on("/api/live", HTTP_GET, handleLive);
+  server.on("/api/sweep", HTTP_GET, handleSweep);
+  server.on("/api/reset", HTTP_POST, []() {
+    resetRequest = true;
+    for (auto &h : hist) h.valid = false;
+    server.send(200, "text/plain", "ok");
+  });
+  server.begin();
 }
 
 // ----------------------------------------------------------------------------
@@ -460,10 +570,12 @@ void setup() {
   for (auto &h : hist) h.valid = false;
   xTaskCreatePinnedToCore(samplingTask, "mesure", 4096, nullptr, 2, nullptr, 0);
 
+  if (WIFI_ENABLE) startWeb();
   Serial.println("t_ms,S1_V,S2_V,Vcc_V,ecart_pct,ecart_min,ecart_max");
 }
 
 void loop() {
+  if (WIFI_ENABLE) server.handleClient();
   static uint32_t tFrame = 0;
   static bool lastN = false, lastR = false;
   static uint32_t tN = 0, tR = 0;

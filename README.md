@@ -64,7 +64,7 @@ L'ADC de l'ESP32 donne une précision de 1 à 2 %, ce qui reste juste face aux s
 1. Installer la carte « esp32 » par Espressif, **version 2.0.17**. TFT_eSPI pose problème avec les versions 3.x.
 2. Installer les bibliothèques *TFT_eSPI* (Bodmer) et, en option, *Adafruit ADS1X15*.
 3. Dans `libraries/TFT_eSPI/User_Setup_Select.h`, commenter `#include <User_Setup.h>` et décommenter `#include <User_Setups/Setup25_TTGO_T_Display.h>`.
-4. Renommer `main.cpp` en `banc_pedale.ino` dans un dossier `banc_pedale/`. Choisir la carte *ESP32 Dev Module* et téléverser.
+4. Renommer `main.cpp` en `banc_pedale.ino` dans un dossier `banc_pedale/`, avec `web_page.h` à côté. Choisir la carte *ESP32 Dev Module* et le schéma de partition **« Huge APP (3MB No OTA) »**, car le Wi-Fi alourdit le programme. Puis téléverser.
 
 ## 5. Utilisation
 
@@ -81,7 +81,21 @@ L'ADC de l'ESP32 donne une précision de 1 à 2 %, ce qui reste juste face aux s
 Voyant d'état : `OK` / `ECART` (> 3 %) / `INCOHERENT` (> 6 %, compté comme incident) / `S1 HS` / `S2 HS` / `PEDALE ?` / `ALIM 5V ?`.
 Ces seuils sont des réglages du banc et non des valeurs constructeur PSA. Ils sont modifiables en haut de `main.cpp`.
 
-## 6. Procédure de test conseillée
+## 6. Interface web
+
+La T-Display crée son propre réseau Wi-Fi :
+
+- réseau **`BANC-PEDALE`**, mot de passe **`psa12345`** (modifiables en haut de `main.cpp`) ;
+- puis ouvrir **http://192.168.4.1** sur un téléphone ou un PC.
+
+La page affiche, 10 fois par seconde :
+- l'écart et la position en gros caractères, ainsi que toutes les tensions ;
+- une courbe sur 20 s de S1 et de K×S2, avec les bandes min/max de toutes les mesures entre deux rafraîchissements, puis l'écart avec les seuils ;
+- le **balayage** (écart max par position) et les **statistiques** (pente, décalage, R², min/max).
+
+Le bouton **Remise à zéro** fait la même chose que le bouton GPIO35. Le bouton **Enregistrer CSV** enregistre directement dans le navigateur (10 lignes/s avec min/max) puis télécharge le fichier, ce qui permet de garder une trace de chaque pédale testée.
+
+## 7. Procédure de test conseillée
 
 1. Brancher et laisser la pédale relâchée. Vérifier S2 entre 0,15 et 0,3 V, S1 ≈ 2×S2 et le statut `OK`.
 2. Appuyer sur GPIO35 (RAZ), puis aller sur l'écran **BALAYAGE**.
